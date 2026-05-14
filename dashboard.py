@@ -197,6 +197,7 @@ st.markdown(
 settings = load_settings()
 db = BotDatabase(settings.database_url)
 metrics = db.compute_metrics()
+shadow_metrics = db.compute_shadow_metrics()
 rows = db.last_predictions(500)
 db.close()
 
@@ -206,6 +207,7 @@ if frame.empty:
     settled = pd.DataFrame()
     signals = pd.DataFrame()
     skipped = pd.DataFrame()
+    shadow = pd.DataFrame()
     hot = pd.DataFrame()
     latest = None
 else:
@@ -215,6 +217,7 @@ else:
     settled = frame[frame["result"].isin(["WIN", "LOSS"])].copy()
     signals = frame[frame["chosen_side"].isin(["UP", "DOWN"])].copy()
     skipped = frame[frame["chosen_side"].eq("SKIP")].copy()
+    shadow = frame[frame["shadow_result"].isin(["WIN", "LOSS"])].copy() if "shadow_result" in frame else pd.DataFrame()
     hot = signals[signals["edge"] >= HOT_EDGE_TARGET].copy()
     latest = frame.iloc[0]
 
@@ -228,6 +231,7 @@ total_bet = float(signals["position_size"].sum()) if "position_size" in signals 
 total_ev = float((signals["position_size"] * signals["expected_value"]).sum()) if not signals.empty and "position_size" in signals else 0.0
 total_pnl = float(frame["pnl"].sum()) if not frame.empty else 0.0
 on_target = signals[signals.apply(lambda row: PROFIT_TARGET_MIN <= profit_pct_for_row(row) <= PROFIT_TARGET_MAX, axis=1)] if not signals.empty else signals
+shadow_wr = shadow_metrics.winrate
 date_label = month_label(latest.get("timestamp") if latest is not None else None)
 safe_mode = metrics.safe_mode_required
 
@@ -261,7 +265,7 @@ st.markdown(
         {metric_card(f"Signal HOT ≥{int(HOT_EDGE_TARGET * 100)}%", str(len(hot)), "edge di atas threshold", "#f59e0b")}
       </div>
       <div class="v7-grid">
-        {metric_card("On-Target Profit", str(len(on_target)), f"profit {PROFIT_TARGET_MIN:.0f}-{PROFIT_TARGET_MAX:.0f}% terpenuhi", "#a78bfa")}
+        {metric_card("Shadow WR", pct(shadow_wr), f"{shadow_metrics.correct}/{shadow_metrics.predictions} prediksi berlabel", "#10b981" if (shadow_wr or 0) >= 0.60 else "#a78bfa")}
         {metric_card("Total Bet/scan", money(total_bet), f"dari ${selected_bankroll} bankroll", "#38bdf8")}
         {metric_card("Total EV/scan", money(total_ev), "expected value per scan", "#10b981" if total_ev >= 0 else "#ef4444")}
         {metric_card("Diblok filter", str(len(skipped)), "Season/Resolved/low vol", "#ef4444")}
@@ -290,7 +294,7 @@ with score_tab:
             {verdict_card("Avg Edge", pct(avg_edge), f"≥ {int(EDGE_TARGET * 100)}%", edge_pass, "Risk manager hanya mengizinkan entry jika edge side terpilih minimal 16%.")}
             {verdict_card("WR Estimasi", pct(avg_wr_est, 0), f"≥ {int(WR_TARGET * 100)}%", wr_pass, "Estimasi model dipakai sebagai gate, bukan janji winrate. Validasi tetap dari settled paper trades.")}
             {verdict_card("Filter Akurasi", f"{len(skipped)}/{scan_count}", "Blok sinyal lemah", len(skipped) >= len(signals), "SKIP dipakai ketika EV, edge, spread, liquidity, feed, atau confidence tidak valid.")}
-            {verdict_card("Signal HOT", f"{len(hot)} signal", f"≥ 1 signal ≥{int(HOT_EDGE_TARGET * 100)}%", hot_pass, "Hot signal berarti edge sudah melewati hard gate dan tetap lolos risk manager.")}
+            {verdict_card("Shadow Learning", pct(shadow_wr), "monitor", shadow_metrics.predictions >= 20, "Semua prediksi diberi label setelah market selesai agar model online bisa belajar meski risk manager memilih SKIP.")}
           </div>
         </div>
         """,
@@ -302,7 +306,7 @@ with score_tab:
     else:
         latest_features = parse_features(latest.get("features"))
         side = str(latest.get("chosen_side", "SKIP"))
-        st.markdown('<div class="v7-panel"><div class="v7-panel-title">📡 Current BTC 5M Signal</div>', unsafe_allow_html=True)
+        st.markdown('<div class="v7-panel-title">📡 Current BTC 5M Signal</div>', unsafe_allow_html=True)
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.markdown(f"<span class='badge' style='background:{signal_color(side)}'>{safe(side)}</span>", unsafe_allow_html=True)
         c2.metric("p_up", num(float(latest.get("p_up") or 0), 4))
@@ -310,9 +314,8 @@ with score_tab:
         c4.metric("edge", num(float(latest.get("edge") or 0), 4))
         c5.metric("confidence", num(float(latest.get("confidence_score") or 0), 1))
         st.caption(str(latest.get("reason") or ""))
-        st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown('<div class="v7-panel"><div class="v7-panel-title">📋 Tabel Analisis Semua Market / Prediksi</div>', unsafe_allow_html=True)
+        st.markdown('<div class="v7-panel-title">📋 Tabel Analisis Semua Market / Prediksi</div>', unsafe_allow_html=True)
         display_cols = [
             "timestamp",
             "slug",
@@ -327,11 +330,13 @@ with score_tab:
             "expected_value",
             "confidence_score",
             "result",
+            "outcome",
+            "shadow_side",
+            "shadow_result",
             "pnl",
             "reason",
         ]
         st.dataframe(frame[[col for col in display_cols if col in frame.columns]].head(80), use_container_width=True, hide_index=True)
-        st.markdown("</div>", unsafe_allow_html=True)
 
 with signals_tab:
     if signals.empty:
@@ -396,7 +401,7 @@ with hot_tab:
             )
 
 with strategy_tab:
-    st.markdown('<div class="v7-panel"><div class="v7-panel-title">📊 Ringkasan Per Strategi / Model</div>', unsafe_allow_html=True)
+    st.markdown('<div class="v7-panel-title">📊 Ringkasan Per Strategi / Model</div>', unsafe_allow_html=True)
     if signals.empty:
         st.info("Belum ada trade untuk diringkas.")
     else:
@@ -414,29 +419,27 @@ with strategy_tab:
     if model_components:
         st.markdown("Model components terbaru")
         st.json(model_components)
-    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown('<div class="v7-panel"><div class="v7-panel-title">📐 Apakah Target 16% & 80% WR Tercapai?</div>', unsafe_allow_html=True)
+    st.markdown('<div class="v7-panel-title">📐 Apakah Target 16% & 80% WR Tercapai?</div>', unsafe_allow_html=True)
     target_rows = pd.DataFrame(
         [
             {"Metrik": "Avg Edge", "Target": ">=16%", "Hasil": pct(avg_edge), "Status": "PASS" if edge_pass else "WATCH"},
             {"Metrik": "Avg WR Est", "Target": ">=80%", "Hasil": pct(avg_wr_est, 0), "Status": "PASS" if wr_pass else "WATCH"},
             {"Metrik": "Signal HOT", "Target": ">=1", "Hasil": str(len(hot)), "Status": "PASS" if hot_pass else "WATCH"},
             {"Metrik": "Settled WR", "Target": "monitor", "Hasil": pct(settled_wr), "Status": "INFO"},
+            {"Metrik": "Shadow WR", "Target": "monitor", "Hasil": pct(shadow_wr), "Status": "INFO"},
             {"Metrik": "SAFE_MODE", "Target": "OFF", "Hasil": "ON" if safe_mode else "OFF", "Status": "WATCH" if safe_mode else "PASS"},
         ]
     )
     st.dataframe(target_rows, use_container_width=True, hide_index=True)
-    st.markdown("</div>", unsafe_allow_html=True)
 
 with skip_tab:
-    st.markdown('<div class="v7-panel"><div class="v7-panel-title">🚫 Market / Prediksi Diblok Filter</div>', unsafe_allow_html=True)
+    st.markdown('<div class="v7-panel-title">🚫 Market / Prediksi Diblok Filter</div>', unsafe_allow_html=True)
     rc = reason_counts(frame)
     if rc.empty:
         st.info("Belum ada SKIP.")
     else:
         st.dataframe(rc, use_container_width=True, hide_index=True)
-    st.markdown("</div>", unsafe_allow_html=True)
 
     for _, row in skipped.head(100).iterrows():
         st.markdown(

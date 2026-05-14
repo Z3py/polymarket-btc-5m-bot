@@ -22,6 +22,13 @@ class Metrics:
     safe_mode_required: bool
 
 
+@dataclass
+class ShadowMetrics:
+    predictions: int
+    correct: int
+    winrate: float | None
+
+
 class BotDatabase:
     def __init__(self, database_url: str = "sqlite:///bot.sqlite3") -> None:
         self.database_url = database_url
@@ -72,6 +79,11 @@ class BotDatabase:
                     expected_value DOUBLE PRECISION,
                     confidence_score DOUBLE PRECISION,
                     position_size DOUBLE PRECISION,
+                    model_side TEXT,
+                    outcome TEXT,
+                    shadow_side TEXT,
+                    shadow_result TEXT,
+                    shadow_correct INTEGER,
                     features TEXT,
                     mode TEXT,
                     reason TEXT,
@@ -103,6 +115,11 @@ class BotDatabase:
                     expected_value REAL,
                     confidence_score REAL,
                     position_size REAL,
+                    model_side TEXT,
+                    outcome TEXT,
+                    shadow_side TEXT,
+                    shadow_result TEXT,
+                    shadow_correct INTEGER,
                     features TEXT,
                     mode TEXT,
                     reason TEXT,
@@ -113,6 +130,11 @@ class BotDatabase:
                 """
             )
         self._ensure_column("predictions", "position_size", "DOUBLE PRECISION" if self.is_postgres else "REAL")
+        self._ensure_column("predictions", "model_side", "TEXT")
+        self._ensure_column("predictions", "outcome", "TEXT")
+        self._ensure_column("predictions", "shadow_side", "TEXT")
+        self._ensure_column("predictions", "shadow_result", "TEXT")
+        self._ensure_column("predictions", "shadow_correct", "INTEGER")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, column_type: str) -> None:
@@ -143,6 +165,7 @@ class BotDatabase:
         reason: str,
         order_id: str | None = None,
         position_size: float | None = None,
+        model_side: str | None = None,
     ) -> int:
         values = (
             datetime.now(timezone.utc).isoformat(),
@@ -160,6 +183,7 @@ class BotDatabase:
             expected_value,
             confidence_score,
             position_size,
+            model_side,
             json.dumps(features, separators=(",", ":")),
             mode,
             reason,
@@ -171,8 +195,9 @@ class BotDatabase:
                 INSERT INTO predictions (
                     timestamp, market_id, slug, start_time, end_time, p_up, p_down,
                     price_up, price_down, chosen_side, entry_price, result, pnl,
-                    edge, expected_value, confidence_score, position_size, features, mode, reason, order_id
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s, %s, %s, %s, %s, %s, %s, %s)
+                    edge, expected_value, confidence_score, position_size, model_side,
+                    outcome, shadow_side, shadow_result, shadow_correct, features, mode, reason, order_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s, %s, %s, %s, %s, NULL, NULL, NULL, NULL, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 values,
@@ -184,8 +209,9 @@ class BotDatabase:
                 INSERT INTO predictions (
                     timestamp, market_id, slug, start_time, end_time, p_up, p_down,
                     price_up, price_down, chosen_side, entry_price, result, pnl,
-                    edge, expected_value, confidence_score, position_size, features, mode, reason, order_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+                    edge, expected_value, confidence_score, position_size, model_side,
+                    outcome, shadow_side, shadow_result, shadow_correct, features, mode, reason, order_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)
                 """,
                 values,
             )
@@ -200,6 +226,53 @@ class BotDatabase:
             (result, pnl, prediction_id),
         )
         self.conn.commit()
+
+    def update_shadow_result(
+        self,
+        prediction_id: int,
+        outcome: str,
+        shadow_side: str,
+        shadow_result: str,
+        shadow_correct: int,
+    ) -> None:
+        placeholder = "%s" if self.is_postgres else "?"
+        self.conn.execute(
+            f"""
+            UPDATE predictions
+            SET outcome = {placeholder}, shadow_side = {placeholder},
+                shadow_result = {placeholder}, shadow_correct = {placeholder}
+            WHERE id = {placeholder}
+            """,
+            (outcome, shadow_side, shadow_result, shadow_correct, prediction_id),
+        )
+        self.conn.commit()
+
+    def unsettled_shadow_predictions(self, now_iso: str, limit: int = 500) -> list[Any]:
+        if self.is_postgres:
+            return list(
+                self.conn.execute(
+                    """
+                    SELECT id, p_up, p_down, end_time, features, model_side
+                    FROM predictions
+                    WHERE outcome IS NULL AND end_time <= %s
+                    ORDER BY id ASC
+                    LIMIT %s
+                    """,
+                    (now_iso, limit),
+                )
+            )
+        return list(
+            self.conn.execute(
+                """
+                SELECT id, p_up, p_down, end_time, features, model_side
+                FROM predictions
+                WHERE outcome IS NULL AND end_time <= ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (now_iso, limit),
+            )
+        )
 
     def last_predictions(self, limit: int = 20) -> list[sqlite3.Row]:
         if self.is_postgres:
@@ -252,6 +325,25 @@ class BotDatabase:
             average_ev_vs_actual_pnl=_mean(ev_diff) if ev_diff else None,
             trade_count=trade_count,
             safe_mode_required=(rolling_50 is not None and rolling_50 < 0.60),
+        )
+
+    def compute_shadow_metrics(self) -> ShadowMetrics:
+        rows = list(
+            self.conn.execute(
+                """
+                SELECT shadow_correct
+                FROM predictions
+                WHERE shadow_result IN ('WIN', 'LOSS')
+                ORDER BY id ASC
+                """
+            )
+        )
+        total = len(rows)
+        correct = sum(1 for row in rows if int(row["shadow_correct"] or 0) == 1)
+        return ShadowMetrics(
+            predictions=total,
+            correct=correct,
+            winrate=(correct / total if total else None),
         )
 
 

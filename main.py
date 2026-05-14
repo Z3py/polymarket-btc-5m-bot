@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -99,6 +100,7 @@ class BotRuntime:
                 )
             )
         await self._settle_paper_positions()
+        await self._settle_shadow_predictions()
         print_signal(market, features, prediction, decision, self.settings.mode_label, self.risk.state.safe_mode)
 
     async def _current_market(self) -> ResolvedMarket:
@@ -167,6 +169,7 @@ class BotRuntime:
             reason=decision.reason,
             order_id=execution.order_id if execution else None,
             position_size=decision.position_size if decision.approved else 0.0,
+            model_side=prediction.recommended_side,
         )
 
     async def _settle_paper_positions(self) -> None:
@@ -181,13 +184,40 @@ class BotRuntime:
             if now < position.end_time:
                 remaining.append(position)
                 continue
-            market_up = btc_now > position.start_price
+            market_up = btc_now >= position.start_price
             won = (position.side == "UP" and market_up) or (position.side == "DOWN" and not market_up)
             pnl = position.stake * ((1 - position.entry_price) / position.entry_price) if won else -position.stake
             self.db.update_result(position.prediction_id, "WIN" if won else "LOSS", pnl)
             self.risk.register_result(pnl)
             self.predictor.update(position.features, 1 if market_up else 0)
         self.open_positions = remaining
+
+    async def _settle_shadow_predictions(self) -> None:
+        btc_now = self.feed.buffer.latest_median(max_age_seconds=30.0)
+        if btc_now is None:
+            return
+        now = datetime.now(timezone.utc)
+        rows = self.db.unsettled_shadow_predictions(now.isoformat())
+        for row in rows:
+            end_time = _parse_dt(row["end_time"])
+            if end_time is None or now - end_time > timedelta(minutes=10):
+                continue
+            features = _feature_vector_from_json(row["features"])
+            if features is None or features.btc_start <= 0:
+                continue
+            market_up = btc_now >= features.btc_start
+            outcome = "UP" if market_up else "DOWN"
+            model_side = str(row["model_side"] or "").upper()
+            shadow_side = model_side if model_side in {"UP", "DOWN"} else ("UP" if float(row["p_up"] or 0.0) >= float(row["p_down"] or 0.0) else "DOWN")
+            correct = int(shadow_side == outcome)
+            self.db.update_shadow_result(
+                int(row["id"]),
+                outcome=outcome,
+                shadow_side=shadow_side,
+                shadow_result="WIN" if correct else "LOSS",
+                shadow_correct=correct,
+            )
+            self.predictor.update(features, 1 if market_up else 0)
 
     async def _wait_for_open_paper_positions(self, max_wait_seconds: float = 360.0) -> None:
         deadline = datetime.now(timezone.utc) + timedelta(seconds=max_wait_seconds)
@@ -196,6 +226,32 @@ class BotRuntime:
             await self._settle_paper_positions()
             if self.open_positions:
                 await asyncio.sleep(min(self.settings.poll_seconds, 5.0))
+
+
+def _parse_dt(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _feature_vector_from_json(value: object) -> FeatureVector | None:
+    try:
+        payload = json.loads(str(value or "{}"))
+    except json.JSONDecodeError:
+        return None
+    fields = set(FeatureVector.__dataclass_fields__.keys())
+    cleaned = {name: payload.get(name, 0.0) for name in fields}
+    try:
+        return FeatureVector(**cleaned)
+    except TypeError:
+        return None
 
 
 def print_signal(

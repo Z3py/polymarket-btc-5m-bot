@@ -38,6 +38,9 @@ class EdgeWinrateReport:
     max_drawdown: float
     brier_score: float | None
     safe_mode_required: bool
+    shadow_predictions: int = 0
+    shadow_correct: int = 0
+    shadow_winrate: float | None = None
 
 
 def simple_prediction_log_backtest(path: str | Path, starting_balance: float = 1000.0) -> BacktestSummary:
@@ -91,6 +94,7 @@ def build_edge_winrate_report(database_url: str, hours: float = 24.0) -> EdgeWin
                 (since,),
             )
         )
+        shadow = db.compute_shadow_metrics()
     finally:
         db.close()
 
@@ -124,6 +128,9 @@ def build_edge_winrate_report(database_url: str, hours: float = 24.0) -> EdgeWin
         max_drawdown=_max_drawdown(pnl),
         brier_score=_mean_float(brier),
         safe_mode_required=(len(trades) >= 50 and (wins / len(trades)) < 0.60),
+        shadow_predictions=shadow.predictions,
+        shadow_correct=shadow.correct,
+        shadow_winrate=shadow.winrate,
     )
 
 
@@ -143,6 +150,8 @@ def print_report(report: EdgeWinrateReport) -> None:
     print(f"Max drawdown: {_fmt_num(report.max_drawdown)}")
     print(f"Brier score: {_fmt_num(report.brier_score)}")
     print(f"SAFE_MODE required: {'YES' if report.safe_mode_required else 'NO'}")
+    print(f"Shadow labeled predictions: {report.shadow_predictions}")
+    print(f"Shadow directional WR: {_fmt_pct(report.shadow_winrate)} ({report.shadow_correct}/{report.shadow_predictions})")
 
 
 def main() -> None:
