@@ -175,9 +175,22 @@ class BTCDataFeed:
         return FeedHealth(True, "OK", median, max_dev, sources)
 
     async def _fetch_binance_rest(self) -> float:
-        response = await self._client.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "BTCUSDT"})
-        response.raise_for_status()
-        return float(response.json()["price"])
+        endpoints = (
+            "https://api.binance.com/api/v3/ticker/price",
+            "https://data-api.binance.vision/api/v3/ticker/price",
+        )
+        last_error: Exception | None = None
+        for endpoint in endpoints:
+            try:
+                response = await self._client.get(endpoint, params={"symbol": "BTCUSDT"})
+                response.raise_for_status()
+                return float(response.json()["price"])
+            except Exception as exc:
+                last_error = exc
+                log.debug("Binance REST endpoint failed %s: %s", endpoint, exc)
+        if last_error:
+            raise last_error
+        raise RuntimeError("No Binance REST endpoints configured")
 
     async def _fetch_coinbase_rest(self) -> float:
         response = await self._client.get("https://api.coinbase.com/v2/prices/BTC-USD/spot")

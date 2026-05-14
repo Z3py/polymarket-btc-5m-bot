@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -84,8 +84,22 @@ def _infer_times_from_slug(slug: str) -> tuple[datetime, datetime]:
             end = start + timedelta(minutes=5)
         return start, end
     ts = int(match.group(1))
-    end = datetime.fromtimestamp(ts, tz=timezone.utc)
-    return end - timedelta(minutes=5), end
+    start = datetime.fromtimestamp(ts, tz=timezone.utc)
+    interval = timedelta(minutes=5) if "updown-5m" in slug.lower() else timedelta(minutes=5)
+    return start, start + interval
+
+
+def _is_btc_5m_slug(slug: str) -> bool:
+    return bool(re.search(r"\bbtc-updown-5m-\d{10}$", slug.lower()))
+
+
+def _candidate_btc_5m_slugs(now: datetime | None = None) -> list[str]:
+    current = now or datetime.now(timezone.utc)
+    current_ts = int(current.timestamp())
+    interval_seconds = 5 * 60
+    current_start = (current_ts // interval_seconds) * interval_seconds
+    starts = range(current_start - interval_seconds, current_start + (4 * interval_seconds), interval_seconds)
+    return [f"btc-updown-5m-{start}" for start in starts]
 
 
 def _token_ids_and_labels(market: dict[str, Any]) -> tuple[str, str]:
@@ -121,6 +135,19 @@ class MarketResolver:
         return self._build_market(slug, market)
 
     def resolve_current_btc_5m(self) -> ResolvedMarket:
+        now = datetime.now(timezone.utc)
+        candidates: list[ResolvedMarket] = []
+        for slug in _candidate_btc_5m_slugs(now):
+            try:
+                market = self._fetch_market_by_slug(slug)
+                resolved = self._build_market(slug, market)
+            except Exception:
+                continue
+            if resolved.end_time > now and not bool(resolved.raw.get("closed")):
+                candidates.append(resolved)
+        if candidates:
+            return min(candidates, key=lambda market: market.end_time)
+
         response = requests.get(
             f"{self.gamma_host}/markets",
             params={
@@ -135,8 +162,6 @@ class MarketResolver:
         )
         response.raise_for_status()
         markets = response.json()
-        now = datetime.now(timezone.utc)
-        candidates: list[ResolvedMarket] = []
         for market in markets:
             slug = str(market.get("slug", ""))
             question = str(market.get("question", "")).lower()
@@ -155,30 +180,40 @@ class MarketResolver:
         return min(candidates, key=lambda market: market.end_time)
 
     def _fetch_market_by_slug(self, slug: str) -> dict[str, Any]:
-        response = requests.get(
-            f"{self.gamma_host}/markets",
-            params={"slug": slug, "limit": 1},
-            timeout=self.timeout,
+        quoted_slug = quote(slug, safe="")
+        endpoints = (
+            (f"{self.gamma_host}/markets/slug/{quoted_slug}", None),
+            (f"{self.gamma_host}/markets", {"slug": slug, "limit": 1}),
+            (f"{self.gamma_host}/events/slug/{quoted_slug}", None),
+            (f"{self.gamma_host}/events", {"slug": slug, "limit": 1}),
         )
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, list) and payload:
-            return payload[0]
-
-        # Some URLs are event slugs. Fetch events and use the first attached market.
-        event_response = requests.get(
-            f"{self.gamma_host}/events",
-            params={"slug": slug, "limit": 1},
-            timeout=self.timeout,
-        )
-        event_response.raise_for_status()
-        events = event_response.json()
-        if isinstance(events, list) and events:
-            event = events[0]
-            markets = event.get("markets") or []
-            if markets:
-                return markets[0]
+        for url, params in endpoints:
+            response = requests.get(url, params=params, timeout=self.timeout)
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            market = self._market_from_payload(response.json())
+            if market:
+                return market
         raise LookupError(f"Could not find market for slug {slug!r}")
+
+    def _market_from_payload(self, payload: Any) -> dict[str, Any] | None:
+        if isinstance(payload, list):
+            for item in payload:
+                market = self._market_from_payload(item)
+                if market:
+                    return market
+            return None
+        if not isinstance(payload, dict):
+            return None
+        markets = payload.get("markets")
+        if isinstance(markets, list):
+            for market in markets:
+                if isinstance(market, dict) and market.get("clobTokenIds"):
+                    return market
+        if payload.get("clobTokenIds") or payload.get("conditionId"):
+            return payload
+        return None
 
     def _build_market(self, slug: str, market: dict[str, Any]) -> ResolvedMarket:
         up_token, down_token = _token_ids_and_labels(market)
@@ -189,12 +224,16 @@ class MarketResolver:
             or _parse_time(market.get("end_time"))
             or inferred_end
         )
-        start_time = (
-            _parse_time(market.get("startDate"))
-            or _parse_time(market.get("startDateIso"))
-            or _parse_time(market.get("start_time"))
-            or inferred_start
-        )
+        if _is_btc_5m_slug(slug):
+            start_time = inferred_start
+            end_time = inferred_end
+        else:
+            start_time = (
+                _parse_time(market.get("startDate"))
+                or _parse_time(market.get("startDateIso"))
+                or _parse_time(market.get("start_time"))
+                or inferred_start
+            )
         return ResolvedMarket(
             slug=str(market.get("slug") or slug),
             market_id=str(market.get("id") or market.get("marketId") or market.get("conditionId") or ""),
