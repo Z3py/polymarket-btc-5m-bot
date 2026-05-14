@@ -1,7 +1,7 @@
-"""Streamlit Community Cloud entrypoint.
+"""Streamlit Community Cloud entrypoint."""
 
-Use this file as the app entrypoint when deploying:
-streamlit_app.py
-"""
+import runpy
+from pathlib import Path
 
-from dashboard import *  # noqa: F401,F403
+
+runpy.run_path(str(Path(__file__).with_name("dashboard.py")), run_name="__main__")
