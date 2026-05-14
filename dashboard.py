@@ -194,9 +194,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if "bankroll" not in st.session_state:
-    st.session_state.bankroll = 200
-
 settings = load_settings()
 db = BotDatabase(settings.database_url)
 metrics = db.compute_metrics()
@@ -242,14 +239,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-cols = st.columns([0.8, 1, 1, 1, 1, 5])
-cols[0].markdown("<div style='color:#64748b;padding-top:10px'>Bankroll:</div>", unsafe_allow_html=True)
-for idx, value in enumerate(PRESETS, start=1):
-    if cols[idx].button(f"${value}", key=f"bankroll_{value}"):
-        st.session_state.bankroll = value
-
-bankroll_html = "<div class='bankroll-row'><span>Selected:</span>" + "".join(
-    f"<span class='bankroll-pill {'active' if value == st.session_state.bankroll else ''}'>${value}</span>"
+selected_bankroll = 200
+bankroll_html = "<div class='bankroll-row'><span>Bankroll:</span>" + "".join(
+    f"<span class='bankroll-pill {'active' if value == selected_bankroll else ''}'>${value}</span>"
     for value in PRESETS
 ) + "</div>"
 st.markdown(bankroll_html, unsafe_allow_html=True)
@@ -270,7 +262,7 @@ st.markdown(
       </div>
       <div class="v7-grid">
         {metric_card("On-Target Profit", str(len(on_target)), f"profit {PROFIT_TARGET_MIN:.0f}-{PROFIT_TARGET_MAX:.0f}% terpenuhi", "#a78bfa")}
-        {metric_card("Total Bet/scan", money(total_bet), f"dari ${st.session_state.bankroll} bankroll", "#38bdf8")}
+        {metric_card("Total Bet/scan", money(total_bet), f"dari ${selected_bankroll} bankroll", "#38bdf8")}
         {metric_card("Total EV/scan", money(total_ev), "expected value per scan", "#10b981" if total_ev >= 0 else "#ef4444")}
         {metric_card("Diblok filter", str(len(skipped)), "Season/Resolved/low vol", "#ef4444")}
       </div>
