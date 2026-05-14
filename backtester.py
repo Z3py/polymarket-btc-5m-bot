@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -41,6 +42,9 @@ class EdgeWinrateReport:
     shadow_predictions: int = 0
     shadow_correct: int = 0
     shadow_winrate: float | None = None
+    unique_markets: int = 0
+    entry_window_scans: int = 0
+    actionable_skips: int = 0
 
 
 def simple_prediction_log_backtest(path: str | Path, starting_balance: float = 1000.0) -> BacktestSummary:
@@ -86,7 +90,7 @@ def build_edge_winrate_report(database_url: str, hours: float = 24.0) -> EdgeWin
         rows = list(
             db.conn.execute(
                 f"""
-                SELECT timestamp, p_up, chosen_side, result, pnl, edge, expected_value
+                SELECT timestamp, slug, p_up, chosen_side, result, pnl, edge, expected_value, reason, features
                 FROM predictions
                 WHERE timestamp >= {placeholder}
                 ORDER BY id ASC
@@ -100,6 +104,16 @@ def build_edge_winrate_report(database_url: str, hours: float = 24.0) -> EdgeWin
 
     predictions = len(rows)
     skips = sum(1 for row in rows if _row(row, "chosen_side") == "SKIP")
+    early_or_late_skips = sum(
+        1
+        for row in rows
+        if _row(row, "chosen_side") == "SKIP"
+        and (
+            "Too early" in str(_row(row, "reason") or "")
+            or "Too close" in str(_row(row, "reason") or "")
+        )
+    )
+    entry_window_scans = sum(1 for row in rows if 20 <= _seconds_to_expiry(row) <= 150)
     trades = [row for row in rows if _row(row, "chosen_side") in {"UP", "DOWN"} and _row(row, "result") in {"WIN", "LOSS"}]
     wins = sum(1 for row in trades if _row(row, "result") == "WIN")
     losses = sum(1 for row in trades if _row(row, "result") == "LOSS")
@@ -131,6 +145,9 @@ def build_edge_winrate_report(database_url: str, hours: float = 24.0) -> EdgeWin
         shadow_predictions=shadow.predictions,
         shadow_correct=shadow.correct,
         shadow_winrate=shadow.winrate,
+        unique_markets=len({str(_row(row, "slug") or "") for row in rows if _row(row, "slug")}),
+        entry_window_scans=entry_window_scans,
+        actionable_skips=max(0, skips - early_or_late_skips),
     )
 
 
@@ -138,7 +155,10 @@ def print_report(report: EdgeWinrateReport) -> None:
     print("\n[24H EDGE / WINRATE REPORT]")
     print(f"Window hours: {report.hours:g}")
     print(f"Predictions logged: {report.predictions}")
+    print(f"Unique markets: {report.unique_markets}")
+    print(f"Entry-window scans: {report.entry_window_scans}")
     print(f"Skips: {report.skips}")
+    print(f"Actionable skips: {report.actionable_skips}")
     print(f"Settled trades: {report.trades}")
     print(f"Wins: {report.wins}")
     print(f"Losses: {report.losses}")
@@ -177,6 +197,20 @@ def _row(row: Any, key: str) -> Any:
     if isinstance(row, dict):
         return row.get(key)
     return row[key]
+
+
+def _seconds_to_expiry(row: Any) -> float:
+    raw = _row(row, "features")
+    if not raw:
+        return 0.0
+    try:
+        parsed = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return 0.0
+    try:
+        return float(parsed.get("seconds_to_expiry") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _mean_float(values: list[Any]) -> float | None:

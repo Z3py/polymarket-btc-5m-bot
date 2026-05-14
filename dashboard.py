@@ -134,6 +134,64 @@ def reason_counts(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"Reason": counts.index, "Count": counts.values})
 
 
+def enrich_scan_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    enriched = frame.copy()
+    feature_dicts = enriched["features"].apply(parse_features) if "features" in enriched else pd.Series([{}] * len(enriched), index=enriched.index)
+    enriched["seconds_to_expiry"] = feature_dicts.apply(lambda item: float(item.get("seconds_to_expiry") or 0.0))
+    enriched["spread_up"] = feature_dicts.apply(lambda item: float(item.get("spread_up") or 0.0))
+    enriched["spread_down"] = feature_dicts.apply(lambda item: float(item.get("spread_down") or 0.0))
+    enriched["entry_window"] = enriched["seconds_to_expiry"].between(20, 150, inclusive="both")
+    enriched["model_side_clean"] = enriched.apply(model_side_for_row, axis=1)
+    enriched["model_price"] = enriched.apply(
+        lambda row: float(row.get("price_up") or 0.0) if row["model_side_clean"] == "UP" else float(row.get("price_down") or 0.0),
+        axis=1,
+    )
+    enriched["model_pwin"] = enriched.apply(
+        lambda row: float(row.get("p_up") or 0.0) if row["model_side_clean"] == "UP" else float(row.get("p_down") or 0.0),
+        axis=1,
+    )
+    enriched["model_spread"] = enriched.apply(
+        lambda row: float(row.get("spread_up") or 0.0) if row["model_side_clean"] == "UP" else float(row.get("spread_down") or 0.0),
+        axis=1,
+    )
+    enriched["model_edge"] = enriched["model_pwin"] - enriched["model_price"]
+    enriched["model_ev"] = enriched["model_edge"] - settings.fee_rate - settings.estimated_slippage
+    return enriched
+
+
+def model_side_for_row(row: pd.Series) -> str:
+    side = str(row.get("model_side") or "").upper()
+    if side in {"UP", "DOWN"}:
+        return side
+    return "UP" if float(row.get("p_up") or 0.0) >= float(row.get("p_down") or 0.0) else "DOWN"
+
+
+def best_candidate_per_market(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or "slug" not in frame:
+        return pd.DataFrame()
+    candidates = frame[frame["entry_window"]].copy()
+    if candidates.empty:
+        return pd.DataFrame()
+    candidates = candidates.sort_values(["model_edge", "model_ev", "confidence_score"], ascending=False)
+    best = candidates.drop_duplicates("slug", keep="first").copy()
+    columns = [
+        "slug",
+        "model_side_clean",
+        "model_pwin",
+        "model_price",
+        "model_edge",
+        "model_ev",
+        "model_spread",
+        "confidence_score",
+        "outcome",
+        "shadow_result",
+        "reason",
+    ]
+    return best[[col for col in columns if col in best.columns]]
+
+
 st.set_page_config(page_title="Bot v7 Backtesting Scorecard", layout="wide")
 
 st.markdown(
@@ -214,6 +272,7 @@ else:
     for col in ["edge", "expected_value", "confidence_score", "pnl", "position_size", "p_up", "p_down", "price_up", "price_down", "entry_price"]:
         if col in frame:
             frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0.0)
+    frame = enrich_scan_frame(frame)
     settled = frame[frame["result"].isin(["WIN", "LOSS"])].copy()
     signals = frame[frame["chosen_side"].isin(["UP", "DOWN"])].copy()
     skipped = frame[frame["chosen_side"].eq("SKIP")].copy()
@@ -222,6 +281,12 @@ else:
     latest = frame.iloc[0]
 
 scan_count = len(frame)
+unique_market_count = int(frame["slug"].nunique()) if not frame.empty and "slug" in frame else 0
+entry_window_scans = int(frame["entry_window"].sum()) if not frame.empty and "entry_window" in frame else 0
+early_skips = skipped[skipped["reason"].fillna("").str.contains("Too early", regex=False)] if not skipped.empty else skipped
+late_skips = skipped[skipped["reason"].fillna("").str.contains("Too close", regex=False)] if not skipped.empty else skipped
+actionable_skips = skipped.drop(index=early_skips.index.union(late_skips.index), errors="ignore") if not skipped.empty else skipped
+market_candidates = best_candidate_per_market(frame)
 settled_wins = int(settled["result"].eq("WIN").sum()) if not settled.empty else 0
 settled_losses = int(settled["result"].eq("LOSS").sum()) if not settled.empty else 0
 settled_wr = settled_wins / len(settled) if len(settled) else None
@@ -238,7 +303,7 @@ safe_mode = metrics.safe_mode_required
 st.markdown(
     f"""
     <div class="v7-title">📡 Bot v7 — Backtesting Data Live {safe(date_label)}</div>
-    <div class="v7-subtitle">{scan_count} market real dari Polymarket · BTC 5M live · Paper forward-test</div>
+    <div class="v7-subtitle">{scan_count} scan dari {unique_market_count} market unik · BTC 5M live · Paper forward-test</div>
     """,
     unsafe_allow_html=True,
 )
@@ -257,18 +322,18 @@ hot_pass = len(hot) >= 1
 st.markdown(
     f"""
     <div class="v7-hero">
-      <div class="v7-section-label">📊 HASIL BACKTESTING — {safe(date_label)} · {scan_count} MARKET DISCAN</div>
+      <div class="v7-section-label">📊 HASIL BACKTESTING — {safe(date_label)} · {scan_count} SCAN · {unique_market_count} MARKET UNIK</div>
       <div class="v7-grid">
-        {metric_card("Signal Lolos", str(len(signals)), f"dari {scan_count} market", "#10b981")}
+        {metric_card("Signal Lolos", str(len(signals)), f"dari {entry_window_scans} scan entry-window", "#10b981")}
         {metric_card("Avg Edge v7", pct(avg_edge), "✅ Target tercapai" if edge_pass else "⚠️ Mendekati target", "#10b981" if edge_pass else "#f59e0b")}
         {metric_card("Avg WR Est", pct(avg_wr_est, 0), "✅ Di atas target" if wr_pass else "⚠️ Di bawah target", "#10b981" if wr_pass else "#f59e0b")}
         {metric_card(f"Signal HOT ≥{int(HOT_EDGE_TARGET * 100)}%", str(len(hot)), "edge di atas threshold", "#f59e0b")}
       </div>
       <div class="v7-grid">
+        {metric_card("Market Unik", str(unique_market_count), "bukan jumlah trade", "#38bdf8")}
         {metric_card("Shadow WR", pct(shadow_wr), f"{shadow_metrics.correct}/{shadow_metrics.predictions} prediksi berlabel", "#10b981" if (shadow_wr or 0) >= 0.60 else "#a78bfa")}
-        {metric_card("Total Bet/scan", money(total_bet), f"dari ${selected_bankroll} bankroll", "#38bdf8")}
         {metric_card("Total EV/scan", money(total_ev), "expected value per scan", "#10b981" if total_ev >= 0 else "#ef4444")}
-        {metric_card("Diblok filter", str(len(skipped)), "Season/Resolved/low vol", "#ef4444")}
+        {metric_card("Actionable Skip", str(len(actionable_skips)), f"{len(early_skips)} early · {len(late_skips)} late", "#ef4444")}
       </div>
     </div>
     """,
@@ -286,20 +351,13 @@ score_tab, signals_tab, hot_tab, strategy_tab, skip_tab = st.tabs(
 )
 
 with score_tab:
-    st.markdown(
-        f"""
-        <div class="v7-panel">
-          <div class="v7-panel-title">🏆 Verdict v7 vs Target — Data {safe(date_label)}</div>
-          <div class="v7-verdict-grid">
-            {verdict_card("Avg Edge", pct(avg_edge), f"≥ {int(EDGE_TARGET * 100)}%", edge_pass, "Risk manager hanya mengizinkan entry jika edge side terpilih minimal 16%.")}
-            {verdict_card("WR Estimasi", pct(avg_wr_est, 0), f"≥ {int(WR_TARGET * 100)}%", wr_pass, "Estimasi model dipakai sebagai gate, bukan janji winrate. Validasi tetap dari settled paper trades.")}
-            {verdict_card("Filter Akurasi", f"{len(skipped)}/{scan_count}", "Blok sinyal lemah", len(skipped) >= len(signals), "SKIP dipakai ketika EV, edge, spread, liquidity, feed, atau confidence tidak valid.")}
-            {verdict_card("Shadow Learning", pct(shadow_wr), "monitor", shadow_metrics.predictions >= 20, "Semua prediksi diberi label setelah market selesai agar model online bisa belajar meski risk manager memilih SKIP.")}
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="v7-panel-title">🏆 Verdict v7 vs Target — Data {safe(date_label)}</div>', unsafe_allow_html=True)
+    v1, v2 = st.columns(2)
+    v1.markdown(verdict_card("Avg Edge", pct(avg_edge), f"≥ {int(EDGE_TARGET * 100)}%", edge_pass, "Risk manager hanya mengizinkan entry jika edge side terpilih minimal 16%."), unsafe_allow_html=True)
+    v2.markdown(verdict_card("WR Estimasi", pct(avg_wr_est, 0), f"≥ {int(WR_TARGET * 100)}%", wr_pass, "Estimasi model dipakai sebagai gate, bukan janji winrate. Validasi tetap dari settled paper trades."), unsafe_allow_html=True)
+    v3, v4 = st.columns(2)
+    v3.markdown(verdict_card("Filter Gate", f"{len(actionable_skips)} blocked", f"{entry_window_scans} entry scans", len(signals) > 0, "Early/late observation tidak dihitung sebagai peluang trade yang hilang."), unsafe_allow_html=True)
+    v4.markdown(verdict_card("Shadow Learning", pct(shadow_wr), "≥ 60%", (shadow_wr or 0.0) >= 0.60, "Semua prediksi diberi label setelah market selesai agar model online bisa belajar meski risk manager memilih SKIP."), unsafe_allow_html=True)
 
     if latest is None:
         st.info("Belum ada prediksi tersimpan. Jalankan `python backtester.py forward --hours 24` dulu.")
@@ -323,6 +381,11 @@ with score_tab:
             "p_down",
             "price_up",
             "price_down",
+            "seconds_to_expiry",
+            "entry_window",
+            "model_side_clean",
+            "model_edge",
+            "model_ev",
             "chosen_side",
             "entry_price",
             "position_size",
@@ -414,6 +477,11 @@ with strategy_tab:
             pnl=("pnl", "sum"),
         ).reset_index()
         st.dataframe(by_side, use_container_width=True, hide_index=True)
+    st.markdown("Best candidate per market unik")
+    if market_candidates.empty:
+        st.info("Belum ada candidate di entry-window 20-150 detik.")
+    else:
+        st.dataframe(market_candidates.head(50), use_container_width=True, hide_index=True)
     latest_features = parse_features(latest.get("features") if latest is not None else None)
     model_components = latest_features.get("model_components", {})
     if model_components:
@@ -428,6 +496,8 @@ with strategy_tab:
             {"Metrik": "Signal HOT", "Target": ">=1", "Hasil": str(len(hot)), "Status": "PASS" if hot_pass else "WATCH"},
             {"Metrik": "Settled WR", "Target": "monitor", "Hasil": pct(settled_wr), "Status": "INFO"},
             {"Metrik": "Shadow WR", "Target": "monitor", "Hasil": pct(shadow_wr), "Status": "INFO"},
+            {"Metrik": "Unique Markets", "Target": "info", "Hasil": str(unique_market_count), "Status": "INFO"},
+            {"Metrik": "Actionable Skip", "Target": "info", "Hasil": str(len(actionable_skips)), "Status": "INFO"},
             {"Metrik": "SAFE_MODE", "Target": "OFF", "Hasil": "ON" if safe_mode else "OFF", "Status": "WATCH" if safe_mode else "PASS"},
         ]
     )
